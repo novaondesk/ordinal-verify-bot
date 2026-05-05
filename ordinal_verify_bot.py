@@ -2,232 +2,306 @@
 """
 Ordinal Verify Bot
 
-Discord bot for verifying Bitcoin Ordinal NFT ownership using BIP322 signatures.
+Discord bot that proves a user controls a Bitcoin address (and lists any
+Ordinal inscriptions held there) via BIP-322 signed messages.
+
+Flow:
+    /verify  address:<btc_addr>      -> bot returns a single-use challenge
+    /submit  signature:<base64_sig>  -> bot verifies & records the binding
+    /whoami                          -> show this user's verified addresses
+
+All responses are ephemeral so signatures and addresses are never visible
+to the rest of the channel.
 """
 
-import discord
-from discord.ext import commands
+from __future__ import annotations
+
 import asyncio
-import base64
-import hashlib
-import json
-import requests
-from typing import Optional, Dict, Any
 import logging
+import os
+import secrets
+import sqlite3
+import time
+from dataclasses import dataclass
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import bip322
+import discord
+import httpx
+from discord import app_commands
+from discord.ext import commands
+from dotenv import load_dotenv
 
-# Discord bot setup
-bot = commands.Bot(command_prefix='!', intents=discord.Intents.all())
+load_dotenv()
 
-# Configuration
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-# Bitcoin RPC or API configuration (to be added)
-BITCOIN_RPC_URL = os.getenv('BITCOIN_RPC_URL')
-BITCOIN_RPC_USER = os.getenv('BITCOIN_RPC_USER')
-BITCOIN_RPC_PASS = os.getenv('BITCOIN_RPC_PASS')
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("ordinal-verify-bot")
 
-class OrdinalVerifier:
-    """Handles Ordinal NFT verification using BIP322 signatures."""
-    
-    def __init__(self):
-        self.op_return_prefix = "ORDI"  # Ordinal inscription prefix
-    
-    def verify_bip322_signature(self, message: str, signature: str, address: str) -> bool:
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+HIRO_API = os.getenv("HIRO_API", "https://api.hiro.so").rstrip("/")
+HIRO_API_KEY = os.getenv("HIRO_API_KEY") or None
+GUILD_ID = int(os.getenv("GUILD_ID", "0")) or None
+VERIFIED_ROLE_ID = int(os.getenv("VERIFIED_ROLE_ID", "0")) or None
+DB_PATH = os.getenv("DB_PATH", "verifications.db")
+CHALLENGE_TTL_SEC = 300
+
+# Slash commands carry their own data — no privileged intents needed.
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+# ----- challenge state ---------------------------------------------------
+
+@dataclass
+class Challenge:
+    nonce: str
+    btc_address: str
+    issued_at: float
+
+
+# discord_id -> Challenge. In-memory by design: a restart invalidates all
+# pending challenges, which is the safe default for nonces.
+_pending: dict[str, Challenge] = {}
+
+
+def make_message(discord_id: str, btc_address: str, nonce: str) -> str:
+    """Challenge string the user signs. Binds discord identity + address + nonce."""
+    return f"OrdinalVerifyBot|discord:{discord_id}|addr:{btc_address}|nonce:{nonce}"
+
+
+# ----- storage -----------------------------------------------------------
+
+def _db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
         """
-        Verify a BIP322 signature.
-        
-        Args:
-            message: The message that was signed
-            signature: The base64 encoded signature
-            address: The Bitcoin address to verify against
-            
-        Returns:
-            bool: True if signature is valid, False otherwise
+        CREATE TABLE IF NOT EXISTS verifications (
+            discord_id  TEXT NOT NULL,
+            btc_address TEXT NOT NULL,
+            verified_at INTEGER NOT NULL,
+            PRIMARY KEY (discord_id, btc_address)
+        )
         """
-        try:
-            # Decode signature
-            sig_bytes = base64.b64decode(signature)
-            
-            # For BIP322, we need to verify against the public key derived from the address
-            # This is a simplified version - actual implementation requires Bitcoin ECDSA verification
-            # and handling of different address types (P2PKH, P2SH, bech32, etc.)
-            
-            # In a real implementation, you would:
-            # 1. Extract public key from signature and message
-            # 2. Derive address from public key
-            # 3. Compare with provided address
-            
-            # For now, we'll simulate verification
-            # Actual implementation would use bitcoinlib or similar
-            
-            logger.info(f"Verifying BIP322 signature for address {address}")
-            return True  # Simplified - always valid for demo
-        except Exception as e:
-            logger.error(f"BIP322 verification error: {e}")
-            return False
-    
-    def get_ordinal_inscriptions(self, address: str) -> Dict[str, Any]:
-        """
-        Fetch Ordinal inscriptions for a given address.
-        
-        This would typically query a Bitcoin node or a service like:
-        - ord.io
-        - nsight.ai
-        - ordinals.com
-        
-        Args:
-            address: Bitcoin address to query
-            
-        Returns:
-            Dict: Inscription data
-        """
-        # Mock data for demonstration
-        # In reality, this would parse the blockchain for OP_RETURN outputs with "ORDI" prefix
-        
-        mock_inscriptions = {
-            "address": address,
-            "insignia_count": 3,
-            "insignia": [
-                {
-                    "id": "insignia_12345",
-                    "name": "My First Ordinal",
-                    "ticker": "ORDI",
-                    "script": "ORDI",
-                    "content": "QmXyZ...",
-                    "block_height": 788000,
-                    " confirmations": 1000
-                }
-            ]
-        }
-        
-        # Simulate API call
-        # response = requests.get(f"https://api.ord.io/wallets/{address}/insignia")
-        # return response.json()
-        
-        return mock_inscriptions
+    )
+    return conn
+
+
+def record_verification(discord_id: str, btc_address: str) -> None:
+    conn = _db()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO verifications(discord_id, btc_address, verified_at) VALUES (?,?,?)",
+            (discord_id, btc_address, int(time.time())),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_verifications(discord_id: str) -> list[tuple[str, int]]:
+    conn = _db()
+    try:
+        return conn.execute(
+            "SELECT btc_address, verified_at FROM verifications WHERE discord_id=? ORDER BY verified_at DESC",
+            (discord_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+# ----- ordinals lookup ---------------------------------------------------
+
+async def fetch_inscriptions(address: str, max_pages: int = 10) -> list[dict]:
+    """Hiro Ordinals API. Public; HIRO_API_KEY raises rate limits."""
+    url = f"{HIRO_API}/ordinals/v1/inscriptions"
+    headers = {"Accept": "application/json"}
+    if HIRO_API_KEY:
+        headers["x-api-key"] = HIRO_API_KEY
+    out: list[dict] = []
+    offset = 0
+    limit = 60
+    async with httpx.AsyncClient(timeout=15) as client:
+        for _ in range(max_pages):
+            r = await client.get(
+                url,
+                params={"address": address, "limit": limit, "offset": offset},
+                headers=headers,
+            )
+            r.raise_for_status()
+            data = r.json()
+            results = data.get("results", []) or []
+            out.extend(results)
+            total = data.get("total", len(out))
+            offset += len(results)
+            if not results or offset >= total:
+                break
+    return out
+
+
+# ----- bot lifecycle -----------------------------------------------------
 
 @bot.event
 async def on_ready():
-    logger.info(f'Ordinal Verify Bot is online! Logged in as {bot.user}')
-    await bot.change_presence(activity=discord.Game(name="!verify <address> <signature>"))
+    log.info("Logged in as %s (id=%s)", bot.user, getattr(bot.user, "id", "?"))
+    _db().close()
+    try:
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+        else:
+            synced = await bot.tree.sync()
+        log.info("Synced %d slash commands", len(synced))
+    except Exception:
+        log.exception("Slash command sync failed")
+    await bot.change_presence(activity=discord.Game(name="/verify"))
 
-@bot.command(name='verify')
-async def verify_command(ctx, address: str, signature: str):
-    """
-    Verify Ordinal NFT ownership using BIP322 signature.
-    
-    Usage: !verify <bitcoin_address> <base64_signature>
-    """
-    logger.info(f"Verification request from {ctx.author}: {address}")
-    
-    verifier = OrdinalVerifier()
-    
-    # Step 1: Verify BIP322 signature
-    is_valid = verifier.verify_bip322_signature(
-        message=f"Verify ownership for {address}",
-        signature=signature,
-        address=address
-    )
-    
-    if not is_valid:
-        await ctx.send(f"❌ Invalid signature for address {address}")
-        return
-    
-    # Step 2: Get Ordinal inscriptions
-    inscriptions = verifier.get_ordinal_inscriptions(address)
-    
-    # Step 3: Build response
-    embed = discord.Embed(
-        title=f"✅ Ownership Verified: {address}",
-        color=discord.Color.green()
-    )
-    
-    embed.add_field(
-        name="Status",
-        value="Signature valid - ownership confirmed",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="Inscriptions",
-        value=f"{len(inscriptions.get('insignia', []))} inscriptions found",
-        inline=False
-    )
-    
-    for inscription in inscriptions.get('insignia', [])[:5]:  # Limit to 5
-        embed.add_field(
-            name=inscription.get('name', 'Unknown'),
-            value=f"ID: {inscription.get('id', 'N/A')}\nBlock: {inscription.get('block_height', 'N/A')}",
-            inline=True
+
+# ----- slash commands ----------------------------------------------------
+
+@bot.tree.command(
+    name="verify",
+    description="Begin Ordinal ownership verification — get a challenge to sign.",
+)
+@app_commands.describe(address="Your Bitcoin address (P2PKH, P2SH-P2WPKH, P2WPKH, or P2TR)")
+async def verify_cmd(interaction: discord.Interaction, address: str):
+    address = address.strip()
+    if not (26 <= len(address) <= 90) or any(c.isspace() for c in address):
+        await interaction.response.send_message(
+            "That doesn't look like a Bitcoin address.", ephemeral=True
         )
-    
-    await ctx.send(embed=embed)
+        return
 
-@bot.command(name='balance')
-async def balance_command(ctx, address: str):
-    """Check Bitcoin balance and Ordinal inscriptions for an address."""
-    verifier = OrdinalVerifier()
-    inscriptions = verifier.get_ordinal_inscriptions(address)
-    
-    # Mock balance
-    balance = {"BTC": 1.2345}
-    
-    embed = discord.Embed(
-        title=f"💰 Balance: {address}",
-        color=discord.Color.blue()
-    )
-    
-    embed.add_field(
-        name="Bitcoin Balance",
-        value=f"{balance['BTC']} BTC",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="Ordinal Inscriptions",
-        value=f"{len(inscriptions.get('insignia', []))} inscriptions",
-        inline=False
-    )
-    
-    await ctx.send(embed=embed)
+    nonce = secrets.token_urlsafe(16)
+    discord_id = str(interaction.user.id)
+    _pending[discord_id] = Challenge(nonce=nonce, btc_address=address, issued_at=time.time())
+    msg = make_message(discord_id, address, nonce)
 
-@bot.command(name='help_verify')
-async def help_command(ctx):
-    """Show help for verification commands."""
     embed = discord.Embed(
-        title="Ordinal Verify Bot Help",
-        color=discord.Color.gold()
+        title="Sign this message with your Bitcoin wallet",
+        description=(
+            "**1.** Open your wallet (Sparrow, Leather, Xverse, Unisat, …) and use "
+            "**Sign Message** for the address below.\n"
+            "**2.** Sign **exactly** the message in the code block.\n"
+            "**3.** Run `/submit signature:<base64>` within 5 minutes.\n\n"
+            f"```\n{msg}\n```"
+        ),
+        color=discord.Color.gold(),
     )
-    
+    embed.add_field(name="Address", value=f"`{address}`", inline=False)
     embed.add_field(
-        name="!verify <address> <signature>",
-        value="Verify Ordinal NFT ownership using BIP322 signature",
-        inline=False
+        name="Expires", value=f"<t:{int(time.time()) + CHALLENGE_TTL_SEC}:R>", inline=False
     )
-    
-    embed.add_field(
-        name="!balance <address>",
-        value="Check Bitcoin balance and Ordinal inscriptions",
-        inline=False
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(
+    name="submit",
+    description="Submit your BIP-322 signature for the active challenge.",
+)
+@app_commands.describe(signature="Base64 BIP-322 signature for the challenge message")
+async def submit_cmd(interaction: discord.Interaction, signature: str):
+    discord_id = str(interaction.user.id)
+    chal = _pending.get(discord_id)
+    if not chal:
+        await interaction.response.send_message(
+            "No active challenge — run `/verify <address>` first.", ephemeral=True
+        )
+        return
+    if time.time() - chal.issued_at > CHALLENGE_TTL_SEC:
+        _pending.pop(discord_id, None)
+        await interaction.response.send_message(
+            "Challenge expired — run `/verify <address>` again.", ephemeral=True
+        )
+        return
+
+    msg = make_message(discord_id, chal.btc_address, chal.nonce)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    # bip322.verify_simple_encoded returns None on success and raises VerificationError otherwise.
+    # It's a Rust call; offload from the event loop just in case.
+    try:
+        await asyncio.to_thread(
+            bip322.verify_simple_encoded, chal.btc_address, msg, signature.strip()
+        )
+    except bip322.VerificationError as e:
+        await interaction.followup.send(f"❌ Invalid signature: `{e}`", ephemeral=True)
+        return
+    except Exception:
+        log.exception("Unexpected BIP-322 verifier error")
+        await interaction.followup.send(
+            "❌ Verifier crashed — check bot logs.", ephemeral=True
+        )
+        return
+
+    # Consume the nonce immediately — single-use even if the steps below fail.
+    _pending.pop(discord_id, None)
+    record_verification(discord_id, chal.btc_address)
+
+    try:
+        inscriptions = await fetch_inscriptions(chal.btc_address)
+    except Exception:
+        log.exception("Hiro inscription lookup failed for %s", chal.btc_address)
+        inscriptions = []
+
+    role_note = ""
+    if VERIFIED_ROLE_ID and isinstance(interaction.user, discord.Member):
+        role = interaction.guild.get_role(VERIFIED_ROLE_ID) if interaction.guild else None
+        if role:
+            try:
+                await interaction.user.add_roles(role, reason="Ordinal ownership verified")
+                role_note = f"\nRole granted: <@&{VERIFIED_ROLE_ID}>"
+            except discord.Forbidden:
+                role_note = "\n(Could not assign role — bot needs Manage Roles + role placed below it.)"
+
+    embed = discord.Embed(
+        title="✅ Ownership verified",
+        description=f"Address `{chal.btc_address}` linked to <@{discord_id}>{role_note}",
+        color=discord.Color.green(),
     )
-    
-    embed.add_field(
-        name="Signature Format",
-        value="Signature must be base64 encoded. Generate using:\n"
-              "1. Write: \"Verify ownership for <address>\"\n"
-              "2. Sign with wallet supporting BIP322\n"
-              "3. Provide the base64 signature",
-        inline=False
-    )
-    
-    await ctx.send(embed=embed)
+    embed.add_field(name="Inscriptions held", value=str(len(inscriptions)), inline=True)
+    if inscriptions:
+        sample = "\n".join(
+            f"• #{i.get('number', '?')} `{str(i.get('id', '?'))[:16]}…`"
+            for i in inscriptions[:5]
+        )
+        embed.add_field(name="First 5", value=sample, inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="whoami", description="Show your verified Bitcoin addresses.")
+async def whoami_cmd(interaction: discord.Interaction):
+    rows = list_verifications(str(interaction.user.id))
+    if not rows:
+        await interaction.response.send_message("No addresses verified yet.", ephemeral=True)
+        return
+    body = "\n".join(f"`{addr}` — verified <t:{ts}:R>" for addr, ts in rows)
+    await interaction.response.send_message(body, ephemeral=True)
+
+
+async def _on_app_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+) -> None:
+    log.exception("Slash command error: %s", error)
+    msg = f"Error: `{error}`"
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
+verify_cmd.error(_on_app_error)
+submit_cmd.error(_on_app_error)
+whoami_cmd.error(_on_app_error)
+
+
+def main() -> None:
+    if not DISCORD_TOKEN:
+        raise SystemExit("DISCORD_TOKEN not set — copy .env.example to .env and fill it in.")
+    bot.run(DISCORD_TOKEN)
+
 
 if __name__ == "__main__":
-    if DISCORD_TOKEN:
-        bot.run(DISCORD_TOKEN)
-    else:
-        logger.error("DISCORD_TOKEN environment variable not set")
-        print("Set DISCORD_TOKEN environment variable to run the bot")
+    main()
