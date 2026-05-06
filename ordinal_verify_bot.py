@@ -131,6 +131,21 @@ def list_verifications(discord_id: str) -> list[tuple[str, int]]:
         conn.close()
 
 
+def all_verified_discord_ids() -> list[str]:
+    """Every discord_id with at least one verified address. Used by /sync_roles
+    to find which guild members to re-check."""
+    conn = _db()
+    try:
+        return [
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT discord_id FROM verifications"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+
 def add_role_rule(guild_id: str, match_type: str, match_value: str, role_id: str) -> int:
     """Returns the new rule_id, or the existing one if the rule already exists."""
     if match_type not in RULE_MATCH_TYPES:
@@ -209,6 +224,28 @@ def evaluate_rules(
     return list(granted)
 
 
+def managed_role_ids(guild_id: str) -> set[str]:
+    """Roles Tapseal is allowed to add/remove during sync. Anything outside
+    this set was granted by some other bot or admin and stays untouched —
+    yanking unrelated roles would be destructive."""
+    ids = {role_id for _, _, _, role_id in list_role_rules(guild_id)}
+    if VERIFIED_ROLE_ID:
+        ids.add(str(VERIFIED_ROLE_ID))
+    return ids
+
+
+def compute_role_diff(
+    member_role_ids: set[str],
+    target_role_ids: set[str],
+    managed: set[str],
+) -> tuple[set[str], set[str]]:
+    """Return (to_add, to_remove) for one member. Removal is restricted to
+    `managed` so we never strip a role Tapseal didn't grant."""
+    to_add = target_role_ids - member_role_ids
+    to_remove = (member_role_ids & managed) - target_role_ids
+    return to_add, to_remove
+
+
 # ----- ordinals lookup ---------------------------------------------------
 
 async def fetch_inscription(inscription_id: str) -> dict | None:
@@ -267,6 +304,35 @@ async def prefetch_meta_collections(guild_id: str) -> dict[str, set[str]]:
                 log.exception("Ordinals Wallet fetch failed for slug=%s", mvalue)
                 out[mvalue] = set()
     return out
+
+
+async def compute_target_roles(
+    guild_id: str,
+    addresses: list[str],
+    meta_lists: dict[str, set[str]] | None = None,
+) -> set[str]:
+    """Roles a member SHOULD have based on current chain state across all
+    their verified addresses. Raises on Ordiscan errors — callers must treat
+    that as 'skip this member', NOT 'they hold nothing' (which would strip
+    every holder-rule role on a transient outage)."""
+    if not addresses:
+        return set()
+    inscriptions: list[dict] = []
+    seen_ids: set[str] = set()
+    for addr in addresses:
+        for insc in await fetch_inscriptions(addr):
+            iid = insc.get("id")
+            if iid and iid not in seen_ids:
+                seen_ids.add(iid)
+                inscriptions.append(insc)
+    if meta_lists is None:
+        meta_lists = await prefetch_meta_collections(guild_id)
+    target = set(evaluate_rules(guild_id, inscriptions, meta_lists))
+    if VERIFIED_ROLE_ID:
+        # Verified role persists as long as they have at least one verified
+        # address — it's about identity proof, not about current holdings.
+        target.add(str(VERIFIED_ROLE_ID))
+    return target
 
 
 async def count_children(parent_id: str) -> int:
@@ -542,6 +608,170 @@ async def whoami_cmd(interaction: discord.Interaction):
         return
     body = "\n".join(f"`{addr}` — verified <t:{ts}:R>" for addr, ts in rows)
     await interaction.response.send_message(body, ephemeral=True)
+
+
+# ----- role sync ---------------------------------------------------------
+
+async def sync_member_roles(
+    guild: discord.Guild,
+    member: discord.Member,
+    addresses: list[str],
+    meta_lists: dict[str, set[str]] | None = None,
+) -> dict:
+    """Re-evaluate `member`'s holdings and bring their roles in line.
+
+    Returns `{added, removed, error}` where `added`/`removed` are role-id
+    lists. On any holdings-fetch error we abort early with `error` set and
+    don't touch a single role — never strip roles based on a transient API
+    failure.
+    """
+    result: dict = {"added": [], "removed": [], "skipped": [], "error": None}
+    if not addresses:
+        result["error"] = "no verified addresses"
+        return result
+    try:
+        target = await compute_target_roles(str(guild.id), addresses, meta_lists)
+    except Exception as e:
+        log.exception("compute_target_roles failed for member=%s", member.id)
+        result["error"] = f"holdings fetch failed: {e!s}"
+        return result
+
+    managed = managed_role_ids(str(guild.id))
+    current = {str(r.id) for r in member.roles}
+    to_add, to_remove = compute_role_diff(current, target, managed)
+
+    bot_top = guild.me.top_role if guild.me else None
+
+    for rid in to_add:
+        role = guild.get_role(int(rid))
+        if not role:
+            result["skipped"].append(f"{rid} (role no longer exists)")
+            continue
+        if bot_top is not None and role >= bot_top:
+            result["skipped"].append(f"{rid} (above bot's top role)")
+            continue
+        try:
+            await member.add_roles(role, reason="Tapseal sync: holdings match rule")
+            result["added"].append(rid)
+        except discord.Forbidden:
+            result["skipped"].append(f"{rid} (forbidden)")
+
+    for rid in to_remove:
+        role = guild.get_role(int(rid))
+        if not role:
+            continue
+        if bot_top is not None and role >= bot_top:
+            result["skipped"].append(f"{rid} (above bot's top role)")
+            continue
+        try:
+            await member.remove_roles(
+                role, reason="Tapseal sync: no longer holds matching ordinal"
+            )
+            result["removed"].append(rid)
+        except discord.Forbidden:
+            result["skipped"].append(f"{rid} (forbidden)")
+
+    return result
+
+
+@bot.tree.command(
+    name="sync_me",
+    description="Re-check your holdings and update your roles.",
+)
+async def sync_me_cmd(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Run this in a server.", ephemeral=True)
+        return
+    addresses = [a for a, _ in list_verifications(str(interaction.user.id))]
+    if not addresses:
+        await interaction.response.send_message(
+            "You haven't verified any addresses yet — run `/verify` first.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    res = await sync_member_roles(interaction.guild, interaction.user, addresses)
+    if res["error"]:
+        await interaction.followup.send(
+            f"❌ {res['error']}. No roles changed.", ephemeral=True
+        )
+        return
+
+    parts: list[str] = []
+    if res["added"]:
+        parts.append("**Added:** " + " ".join(f"<@&{r}>" for r in res["added"]))
+    if res["removed"]:
+        parts.append("**Removed:** " + " ".join(f"<@&{r}>" for r in res["removed"]))
+    if res["skipped"]:
+        parts.append("⚠️ Skipped: " + ", ".join(res["skipped"][:5]))
+    if not parts:
+        parts.append("✅ Already in sync — no changes.")
+    await interaction.followup.send("\n".join(parts), ephemeral=True)
+
+
+@bot.tree.command(
+    name="sync_roles",
+    description="Re-check holdings for verified members and update their roles. Admin only.",
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    member="Sync only this member (default: every verified member in the guild)",
+)
+async def sync_roles_cmd(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+):
+    if not interaction.guild:
+        await interaction.response.send_message("Run this in a server.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    targets: list[discord.Member] = []
+    if member is not None:
+        targets = [member]
+    else:
+        for did in all_verified_discord_ids():
+            m = interaction.guild.get_member(int(did))
+            if m:
+                targets.append(m)
+
+    if not targets:
+        await interaction.followup.send(
+            "No verified members in this guild to sync.", ephemeral=True
+        )
+        return
+
+    # Prefetch OW collections once for the whole batch — cached across members.
+    meta_lists = await prefetch_meta_collections(str(interaction.guild.id))
+
+    total_added = 0
+    total_removed = 0
+    errors = 0
+    detail: list[str] = []
+    for m in targets:
+        addresses = [a for a, _ in list_verifications(str(m.id))]
+        res = await sync_member_roles(interaction.guild, m, addresses, meta_lists)
+        if res["error"]:
+            errors += 1
+            detail.append(f"<@{m.id}>: ⚠️ {res['error']}")
+            continue
+        a, r = len(res["added"]), len(res["removed"])
+        total_added += a
+        total_removed += r
+        if a or r:
+            detail.append(f"<@{m.id}>: +{a} -{r}")
+
+    summary = (
+        f"Synced **{len(targets)}** member(s) — added **{total_added}**, "
+        f"removed **{total_removed}**, errors **{errors}**."
+    )
+    if detail:
+        head = "\n".join(detail[:15])
+        more = f"\n…+{len(detail) - 15} more" if len(detail) > 15 else ""
+        summary += f"\n\n{head}{more}"
+    await interaction.followup.send(summary, ephemeral=True)
 
 
 # ----- admin: holder-rule management -------------------------------------
