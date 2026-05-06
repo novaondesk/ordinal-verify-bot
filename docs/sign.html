@@ -3,117 +3,205 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <meta name="color-scheme" content="dark">
   <title>Tapseal — Sign Challenge</title>
+  <link rel="stylesheet" href="https://unpkg.com/98.css">
+  <!-- pixel-art seal favicon (inline SVG, data URI) -->
+  <link rel="icon" href='data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22 shape-rendering=%22crispEdges%22><rect x=%222%22 y=%227%22 width=%2211%22 height=%225%22 fill=%22%235a5a5a%22/><rect x=%223%22 y=%226%22 width=%2210%22 height=%221%22 fill=%22%235a5a5a%22/><rect x=%223%22 y=%2212%22 width=%2210%22 height=%221%22 fill=%22%235a5a5a%22/><rect x=%2212%22 y=%226%22 width=%223%22 height=%224%22 fill=%22%235a5a5a%22/><rect x=%2214%22 y=%227%22 width=%221%22 height=%222%22 fill=%22%235a5a5a%22/><rect x=%2213%22 y=%227%22 width=%221%22 height=%221%22 fill=%22%23000%22/><rect x=%2214%22 y=%229%22 width=%221%22 height=%221%22 fill=%22%23000%22/><rect x=%223%22 y=%229%22 width=%229%22 height=%222%22 fill=%22%23888%22/><rect x=%220%22 y=%228%22 width=%222%22 height=%223%22 fill=%22%235a5a5a%22/></svg>'>
   <style>
-    :root {
-      color-scheme: dark;
-      --bg: #0e0f12;
-      --card: #1a1c22;
-      --code-bg: #0a0b0e;
-      --text: #eee;
-      --muted: #8a8d96;
-      --accent: #f7931a;
-      --accent-text: #1a0f00;
-      --secondary: #2a2f3a;
-      --ok: #4ade80;
-      --err: #ff6464;
-    }
-    * { box-sizing: border-box; }
-    html, body { margin: 0; padding: 0; }
+    /* desktop wallpaper */
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      padding: 1.25rem;
-      line-height: 1.4;
-    }
-    .wrap { max-width: 640px; margin: 1.5rem auto; }
-    header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem; }
-    header h1 { margin: 0; font-size: 1.25rem; font-weight: 700; }
-    header .badge { font-size: 0.7rem; color: var(--accent); border: 1px solid var(--accent); padding: 0.1rem 0.4rem; border-radius: 999px; }
-    .card { background: var(--card); border-radius: 12px; padding: 1rem 1.1rem; margin-bottom: 0.85rem; }
-    .label { color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 0.4rem; }
-    pre, code {
-      background: var(--code-bg);
-      color: #e0e0e0;
-      padding: 0.6rem 0.75rem;
-      border-radius: 8px;
-      overflow-wrap: anywhere;
-      word-break: break-all;
-      white-space: pre-wrap;
-      font-size: 0.85rem;
-      font-family: "SF Mono", "Cascadia Code", Consolas, ui-monospace, monospace;
       margin: 0;
+      min-height: 100vh;
+      background: #008080; /* the iconic teal */
+      padding: 1rem;
+      font-family: "Pixelated MS Sans Serif", "MS Sans Serif", Arial, sans-serif;
     }
-    button {
-      width: 100%;
-      padding: 0.95rem 1.1rem;
-      border: 0;
-      border-radius: 10px;
-      font-size: 1rem;
-      font-weight: 600;
-      cursor: pointer;
-      font-family: inherit;
-      -webkit-tap-highlight-color: transparent;
+    .desk { display: flex; justify-content: center; padding-top: 1rem; }
+    .window { width: 100%; max-width: 560px; }
+    .window-body { padding: 12px; }
+    .field { margin-bottom: 12px; }
+    .field-label {
+      font-weight: bold;
+      margin-bottom: 4px;
+      font-size: 12px;
     }
-    button.primary { background: var(--accent); color: var(--accent-text); }
-    button.secondary { background: var(--secondary); color: var(--text); }
-    button:disabled { opacity: 0.55; cursor: not-allowed; }
-    button + button { margin-top: 0.6rem; }
-    .small { font-size: 0.82rem; color: var(--muted); margin: 0.55rem 0 0; }
-    .ok { color: var(--ok); }
-    .err { color: var(--err); }
+    .readout {
+      background: #fff;
+      border: 1px inset #c0c0c0;
+      padding: 6px 8px;
+      font-family: "Lucida Console", "Courier New", monospace;
+      font-size: 11px;
+      word-break: break-all;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+      min-height: 1.2em;
+    }
+    .actions { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+    button { width: 100%; min-height: 36px; font-size: 14px; }
+    .status { font-size: 12px; margin-top: 8px; min-height: 1.2em; }
+    .status.ok { color: #006400; font-weight: bold; }
+    .status.err { color: #800000; font-weight: bold; }
+    .footer-bar {
+      margin-top: 1.5rem;
+      text-align: center;
+      color: #c0c0c0;
+      font-size: 11px;
+      text-shadow: 1px 1px 0 #000;
+    }
+    .footer-bar a { color: #fff; text-decoration: underline; }
+    .seal-icon {
+      width: 14px;
+      height: 14px;
+      vertical-align: -2px;
+      margin-right: 4px;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+    .seal-big {
+      width: 64px;
+      height: 64px;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+      display: block;
+      margin: 0 auto 8px;
+    }
     .hidden { display: none; }
-    a { color: var(--accent); }
-    footer { text-align: center; color: var(--muted); font-size: 0.75rem; margin-top: 2rem; }
+    /* taskbar — pure ornament */
+    .taskbar {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 28px;
+      background: #c0c0c0;
+      border-top: 2px solid #fff;
+      display: flex;
+      align-items: center;
+      padding: 2px 4px;
+      box-shadow: inset 0 1px 0 #dfdfdf, 0 -1px 0 #808080;
+    }
+    .taskbar .start {
+      height: 22px;
+      padding: 0 8px;
+      font-weight: bold;
+      font-size: 11px;
+      background: #c0c0c0;
+      border-top: 1px solid #fff;
+      border-left: 1px solid #fff;
+      border-right: 1px solid #808080;
+      border-bottom: 1px solid #808080;
+      cursor: default;
+    }
+    .taskbar .clock {
+      margin-left: auto;
+      padding: 2px 8px;
+      font-size: 11px;
+      border-top: 1px solid #808080;
+      border-left: 1px solid #808080;
+      border-right: 1px solid #fff;
+      border-bottom: 1px solid #fff;
+    }
+    body { padding-bottom: 40px; }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <header>
-      <h1>Tapseal</h1>
-      <span class="badge">BIP-322</span>
-    </header>
+  <div class="desk">
+    <div class="window">
+      <div class="title-bar">
+        <div class="title-bar-text">
+          <svg class="seal-icon" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true">
+            <rect x="2" y="7" width="11" height="5" fill="#fff"/>
+            <rect x="3" y="6" width="10" height="1" fill="#fff"/>
+            <rect x="3" y="12" width="10" height="1" fill="#fff"/>
+            <rect x="12" y="6" width="3" height="4" fill="#fff"/>
+            <rect x="14" y="7" width="1" height="2" fill="#fff"/>
+            <rect x="13" y="7" width="1" height="1" fill="#000080"/>
+            <rect x="14" y="9" width="1" height="1" fill="#000080"/>
+            <rect x="0" y="8" width="2" height="3" fill="#fff"/>
+          </svg>
+          Tapseal — Sign Challenge
+        </div>
+        <div class="title-bar-controls">
+          <button aria-label="Minimize" disabled></button>
+          <button aria-label="Maximize" disabled></button>
+          <button aria-label="Close" onclick="history.back()"></button>
+        </div>
+      </div>
+      <div class="window-body">
+        <!-- big mascot (pixel art seal) -->
+        <svg class="seal-big" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-label="Tapseal mascot">
+          <rect x="2" y="7" width="11" height="5" fill="#5a5a5a"/>
+          <rect x="3" y="6" width="10" height="1" fill="#5a5a5a"/>
+          <rect x="3" y="12" width="10" height="1" fill="#5a5a5a"/>
+          <rect x="12" y="6" width="3" height="4" fill="#5a5a5a"/>
+          <rect x="14" y="7" width="1" height="2" fill="#5a5a5a"/>
+          <rect x="13" y="7" width="1" height="1" fill="#000"/>
+          <rect x="14" y="9" width="1" height="1" fill="#000"/>
+          <rect x="3" y="9" width="9" height="2" fill="#a0a0a0"/>
+          <rect x="0" y="8" width="2" height="3" fill="#5a5a5a"/>
+          <!-- bitcoin orange dot held by the seal -->
+          <rect x="11" y="11" width="2" height="1" fill="#f7931a"/>
+          <rect x="11" y="12" width="2" height="1" fill="#f7931a"/>
+        </svg>
 
-    <div id="warn" class="card hidden"></div>
+        <div id="warn" class="hidden">
+          <div role="alert" style="background:#ffdddd;border:1px solid #800000;padding:8px;margin-bottom:12px;font-size:12px;color:#800000">
+            ⚠️ Missing <code>addr</code> or <code>msg</code> in URL. This page should be opened from the Tapseal Discord bot.
+          </div>
+        </div>
 
-    <div class="card">
-      <div class="label">Address</div>
-      <code id="addr">…</code>
+        <fieldset>
+          <legend>Address</legend>
+          <div id="addr" class="readout">…</div>
+        </fieldset>
+
+        <fieldset style="margin-top:10px">
+          <legend>Message to sign (BIP-322)</legend>
+          <div id="msg" class="readout">…</div>
+        </fieldset>
+
+        <div class="actions">
+          <button id="sign" class="default">🔐 Sign with my wallet</button>
+        </div>
+        <p class="status" id="status">
+          Click to invoke your Bitcoin wallet (Xverse, Leather, OKX, Magic Eden, UniSat).
+          On mobile this opens the wallet app via deep-link.
+        </p>
+
+        <fieldset id="result-card" class="hidden" style="margin-top:14px">
+          <legend>Signature</legend>
+          <div id="sig" class="readout"></div>
+          <div class="actions">
+            <button id="copy">📋 Copy signature</button>
+          </div>
+          <p class="status">
+            Switch back to Discord and run <code>/submit signature:&lt;paste&gt;</code>.
+          </p>
+        </fieldset>
+
+      </div>
+
+      <!-- status bar -->
+      <div class="status-bar">
+        <p class="status-bar-field">Tapseal v1</p>
+        <p class="status-bar-field">BIP-322 Simple</p>
+        <p class="status-bar-field" id="netfield">Mainnet</p>
+      </div>
     </div>
+  </div>
 
-    <div class="card">
-      <div class="label">Message to sign</div>
-      <pre id="msg">…</pre>
-    </div>
+  <div class="footer-bar">
+    open-source · <a href="https://github.com/novaondesk/ordinal-verify-bot">github</a>
+  </div>
 
-    <div class="card" id="sign-card">
-      <button id="sign" class="primary">🔐 Sign with my wallet</button>
-      <p class="small" id="status">
-        Tap to invoke your Bitcoin wallet (Xverse, Leather, OKX, Magic Eden,
-        UniSat). Mobile wallets will open via deep-link.
-      </p>
-    </div>
-
-    <div class="card hidden" id="result-card">
-      <div class="label">Signature</div>
-      <pre id="sig"></pre>
-      <button id="copy" class="secondary">📋 Copy signature</button>
-      <p class="small">
-        Switch back to Discord and run
-        <code>/submit signature:&lt;paste&gt;</code>.
-      </p>
-    </div>
-
-    <footer>
-      Open-source · <a href="https://github.com/0xAjax-ai/ordinal-verify-bot">github</a>
-    </footer>
+  <div class="taskbar">
+    <div class="start">⊞ Start</div>
+    <div class="clock" id="clock">--:--</div>
   </div>
 
   <script type="module">
-    // Sats Connect bundles the wallet picker + deep-link logic for Xverse,
-    // Leather, OKX, Magic Eden, etc. Loaded as ESM via esm.sh — no build step.
+    // Sats Connect: unified API for Xverse, Leather, OKX, Magic Eden, UniSat.
+    // Loaded as ESM via esm.sh — no build step.
     import { request } from "https://esm.sh/sats-connect@3";
 
     const $ = (id) => document.getElementById(id);
@@ -122,21 +210,29 @@
     const message = params.get("msg") || "";
 
     if (!address || !message) {
-      const w = $("warn");
-      w.classList.remove("hidden");
-      w.innerHTML =
-        '<span class="err">Missing <code>addr</code> or <code>msg</code> in URL.</span>' +
-        '<p class="small">This page is meant to be opened from the Tapseal Discord bot.</p>';
+      $("warn").classList.remove("hidden");
       $("sign").disabled = true;
     }
 
     $("addr").textContent = address || "(none)";
     $("msg").textContent = message || "(none)";
 
+    // Cute touch: live clock
+    const clk = $("clock");
+    const tick = () => {
+      const d = new Date();
+      const h = String(d.getHours()).padStart(2, "0");
+      const m = String(d.getMinutes()).padStart(2, "0");
+      clk.textContent = `${h}:${m}`;
+    };
+    tick();
+    setInterval(tick, 30_000);
+
     $("sign").addEventListener("click", async () => {
       const status = $("status");
       $("sign").disabled = true;
-      status.innerHTML = "Asking your wallet…";
+      status.className = "status";
+      status.textContent = "Asking your wallet…";
       try {
         const resp = await request("signMessage", {
           address,
@@ -146,20 +242,27 @@
         if (resp && resp.status === "success" && resp.result?.signature) {
           $("sig").textContent = resp.result.signature;
           $("result-card").classList.remove("hidden");
-          status.innerHTML = '<span class="ok">✅ Signed. Copy below and paste into /submit.</span>';
+          status.className = "status ok";
+          status.textContent = "✅ Signed. Copy below and paste into /submit.";
           $("result-card").scrollIntoView({ behavior: "smooth", block: "start" });
         } else {
           const errMsg = resp?.error?.message || "Wallet returned no signature.";
-          status.innerHTML = '<span class="err">❌ ' + errMsg + "</span>";
+          status.className = "status err";
+          status.textContent = "❌ " + errMsg;
           $("sign").disabled = false;
         }
       } catch (e) {
         const txt = (e && e.message) || String(e);
+        status.className = "status err";
         status.innerHTML =
-          '<span class="err">❌ ' + txt + "</span>" +
-          '<p class="small">No compatible wallet found? Try Xverse, Leather, ' +
-          "OKX, Magic Eden, or UniSat. On desktop use the browser extension; " +
-          "on mobile open this page from your wallet's in-app browser.</p>";
+          "❌ " + txt +
+          "<br><span style='font-weight:normal;color:#000'>No wallet detected? Install one of: " +
+          "<a href='https://www.xverse.app'>Xverse</a> · " +
+          "<a href='https://leather.io'>Leather</a> · " +
+          "<a href='https://www.okx.com/web3'>OKX</a> · " +
+          "<a href='https://magiceden.io/wallet'>Magic Eden</a> · " +
+          "<a href='https://unisat.io'>UniSat</a>" +
+          "</span>";
         $("sign").disabled = false;
       }
     });
@@ -168,7 +271,7 @@
       const btn = $("copy");
       try {
         await navigator.clipboard.writeText($("sig").textContent);
-        btn.textContent = "✓ Copied";
+        btn.textContent = "✓ Copied to clipboard";
         setTimeout(() => (btn.textContent = "📋 Copy signature"), 2000);
       } catch {
         btn.textContent = "Couldn't copy — long-press the signature above";
