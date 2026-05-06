@@ -158,3 +158,28 @@ def test_evaluate_isolated_per_guild(bot):
     held = [_insc(id_="x", parent="P")]
     assert bot.evaluate_rules("guild-A", held) == ["role-A"]
     assert bot.evaluate_rules("guild-B", held) == ["role-B"]
+
+
+def test_evaluate_meta_collection_match(bot):
+    """Pre-Sept-2023 collections (e.g. Ordinal Pizza OG) match against an
+    Ordinals Wallet curated id-set passed in via meta_lists."""
+    bot.add_role_rule("g", "meta_collection", "ordinal-pizza-og", "pizzaowner")
+    held = [_insc(id_="d22d88cd...i0"), _insc(id_="unrelated...i0")]
+    meta = {"ordinal-pizza-og": {"d22d88cd...i0", "another...i0"}}
+    assert bot.evaluate_rules("g", held, meta) == ["pizzaowner"]
+
+
+def test_evaluate_meta_collection_miss(bot):
+    bot.add_role_rule("g", "meta_collection", "ordinal-pizza-og", "pizzaowner")
+    held = [_insc(id_="orphan...i0")]
+    meta = {"ordinal-pizza-og": {"a...i0", "b...i0"}}
+    assert bot.evaluate_rules("g", held, meta) == []
+
+
+def test_evaluate_meta_collection_no_meta_lists_treated_as_miss(bot):
+    """If the prefetch failed and no IDs were provided, the rule simply
+    doesn't match — bot keeps working, just doesn't grant the role."""
+    bot.add_role_rule("g", "meta_collection", "ordinal-pizza-og", "pizzaowner")
+    held = [_insc(id_="d22d88cd...i0")]
+    assert bot.evaluate_rules("g", held) == []
+    assert bot.evaluate_rules("g", held, {}) == []

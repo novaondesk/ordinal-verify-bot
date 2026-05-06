@@ -75,7 +75,10 @@ def make_message(discord_id: str, btc_address: str, nonce: str) -> str:
 
 # ----- storage -----------------------------------------------------------
 
-RULE_MATCH_TYPES = ("inscription", "parent", "collection")
+RULE_MATCH_TYPES = ("inscription", "parent", "collection", "meta_collection")
+
+OW_API = "https://turbo.ordinalswallet.com"
+_OW_COLLECTION_CACHE: dict[str, set[str]] = {}
 
 
 def _db() -> sqlite3.Connection:
@@ -173,23 +176,36 @@ def list_role_rules(guild_id: str) -> list[tuple[int, str, str, str]]:
         conn.close()
 
 
-def evaluate_rules(guild_id: str, inscriptions: list[dict]) -> list[str]:
+def evaluate_rules(
+    guild_id: str,
+    inscriptions: list[dict],
+    meta_lists: dict[str, set[str]] | None = None,
+) -> list[str]:
     """Return the de-duplicated list of role_ids to grant given the user's
-    inscriptions and the guild's configured rules."""
+    inscriptions and the guild's configured rules.
+
+    `meta_lists` maps an Ordinals Wallet slug to the curated set of inscription
+    IDs in that collection. Required for any `meta_collection` rules; callers
+    should pre-fetch via `prefetch_meta_collections` so this stays sync.
+    """
     rules = list_role_rules(guild_id)
     if not rules or not inscriptions:
         return []
+    meta_lists = meta_lists or {}
+    held_ids = {i.get("id") for i in inscriptions if i.get("id")}
     granted: set[str] = set()
     for _rid, mtype, mvalue, role_id in rules:
-        for insc in inscriptions:
-            field = {
-                "inscription": "id",
-                "parent": "parent_inscription_id",
-                "collection": "collection_slug",
-            }[mtype]
-            if insc.get(field) == mvalue:
+        if mtype == "meta_collection":
+            if held_ids & meta_lists.get(mvalue, set()):
                 granted.add(role_id)
-                break
+            continue
+        field = {
+            "inscription": "id",
+            "parent": "parent_inscription_id",
+            "collection": "collection_slug",
+        }[mtype]
+        if any(i.get(field) == mvalue for i in inscriptions):
+            granted.add(role_id)
     return list(granted)
 
 
@@ -207,6 +223,50 @@ async def fetch_inscription(inscription_id: str) -> dict | None:
             return None
         r.raise_for_status()
         return r.json().get("data")
+
+
+async def fetch_ow_collection_ids(slug: str) -> set[str]:
+    """Fetch the curated inscription-id set for an Ordinals Wallet collection.
+
+    Used for pre-Sept-2023 collections (Ordinal Pizza OG, etc) that don't have
+    on-chain parent linkage and aren't indexed by Ordiscan. Cached for the bot's
+    lifetime — these collections are static.
+    """
+    if slug in _OW_COLLECTION_CACHE:
+        return _OW_COLLECTION_CACHE[slug]
+    url = f"{OW_API}/collection/{slug}/inscriptions"
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, headers={"Accept": "application/json"})
+        r.raise_for_status()
+        data = r.json() or []
+    ids = {item.get("id") for item in data if isinstance(item, dict) and item.get("id")}
+    _OW_COLLECTION_CACHE[slug] = ids
+    return ids
+
+
+async def fetch_ow_collection_meta(slug: str) -> dict | None:
+    """Fetch the OW collection's metadata (name, supply, etc). None if 404."""
+    url = f"{OW_API}/collection/{slug}"
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url, headers={"Accept": "application/json"})
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+
+
+async def prefetch_meta_collections(guild_id: str) -> dict[str, set[str]]:
+    """Resolve all `meta_collection` slugs in this guild's rules to ID sets.
+    Failures fall back to an empty set so the rule simply doesn't match."""
+    out: dict[str, set[str]] = {}
+    for _rid, mtype, mvalue, _role_id in list_role_rules(guild_id):
+        if mtype == "meta_collection" and mvalue not in out:
+            try:
+                out[mvalue] = await fetch_ow_collection_ids(mvalue)
+            except Exception:
+                log.exception("Ordinals Wallet fetch failed for slug=%s", mvalue)
+                out[mvalue] = set()
+    return out
 
 
 async def count_children(parent_id: str) -> int:
@@ -435,7 +495,10 @@ async def submit_cmd(interaction: discord.Interaction, signature: str):
 
     # Per-collection holder rules
     if interaction.guild and isinstance(interaction.user, discord.Member):
-        rule_role_ids = evaluate_rules(str(interaction.guild.id), inscriptions)
+        meta_lists = await prefetch_meta_collections(str(interaction.guild.id))
+        rule_role_ids = evaluate_rules(
+            str(interaction.guild.id), inscriptions, meta_lists
+        )
         for rid in rule_role_ids:
             role = interaction.guild.get_role(int(rid))
             if not role:
@@ -487,6 +550,10 @@ _RULE_TYPE_CHOICES = [
     app_commands.Choice(name="inscription (single specific NFT)", value="inscription"),
     app_commands.Choice(name="parent (every child of this parent inscription)", value="parent"),
     app_commands.Choice(name="collection (Ordiscan-indexed collection slug)", value="collection"),
+    app_commands.Choice(
+        name="meta_collection (Ordinals Wallet slug — pre-2023 collections)",
+        value="meta_collection",
+    ),
 ]
 
 
@@ -525,9 +592,12 @@ async def rule_help_cmd(interaction: discord.Interaction):
         value=(
             "**inscription** — one specific NFT only.\n"
             "**parent** — every child of a parent inscription. Best for on-chain "
-            "recursive collections (Pizza Pepes, Bitcoin Frogs, etc).\n"
+            "recursive collections (post-Sept-2023; uses on-chain provenance).\n"
             "**collection** — an Ordiscan-indexed collection slug (most curated "
-            "collections; some don't have one)."
+            "collections; some don't have one).\n"
+            "**meta_collection** — an Ordinals Wallet slug. Use for early "
+            "collections that predate on-chain parent-child (Ordinal Pizza OG, "
+            "Bitcoin Rocks, etc) and aren't on Ordiscan."
         ),
         inline=False,
     )
@@ -540,7 +610,9 @@ async def rule_help_cmd(interaction: discord.Interaction):
             "parent inscription's ID — use it with `type:parent` to cover the "
             "whole collection.\n"
             "**collection**: the URL slug, e.g. `bitcoin-frogs` from "
-            "`https://ordiscan.com/collection/bitcoin-frogs`."
+            "`https://ordiscan.com/collection/bitcoin-frogs`.\n"
+            "**meta_collection**: the slug from "
+            "`https://ordinalswallet.com/collection/<slug>`, e.g. `ordinal-pizza-og`."
         ),
         inline=False,
     )
@@ -599,7 +671,7 @@ async def rule_add_cmd(
     mtype = type.value
     mvalue = value.strip()
 
-    # Live validation against Ordiscan
+    # Live validation
     try:
         if mtype in ("inscription", "parent"):
             insc = await fetch_inscription(mvalue)
@@ -634,10 +706,25 @@ async def rule_add_cmd(
                     return
                 more = "+" if child_count >= 100 else ""
                 preview += f" • {child_count}{more} children"
+        elif mtype == "meta_collection":
+            meta = await fetch_ow_collection_meta(mvalue)
+            if meta is None:
+                await interaction.followup.send(
+                    f"❌ Ordinals Wallet doesn't recognize `{mvalue}` as a "
+                    "collection slug. Find the slug at "
+                    "<https://ordinalswallet.com/collection/...>.",
+                    ephemeral=True,
+                )
+                return
+            ids = await fetch_ow_collection_ids(mvalue)
+            preview = (
+                f"**{meta.get('name') or mvalue}** • "
+                f"{meta.get('total_supply') or len(ids)} items"
+            )
     except Exception:
-        log.exception("Ordiscan validation failed during /rule_add")
+        log.exception("Validation failed during /rule_add")
         # Don't block on transient failures; admin can still save the rule.
-        preview = "(could not validate — Ordiscan unreachable, saving anyway)"
+        preview = "(could not validate — upstream unreachable, saving anyway)"
 
     rule_id = add_role_rule(
         guild_id=str(interaction.guild.id),
