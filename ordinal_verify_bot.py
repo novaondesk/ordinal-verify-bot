@@ -40,8 +40,8 @@ logging.basicConfig(
 log = logging.getLogger("ordinal-verify-bot")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-HIRO_API = os.getenv("HIRO_API", "https://api.hiro.so").rstrip("/")
-HIRO_API_KEY = os.getenv("HIRO_API_KEY") or None
+XVERSE_API = os.getenv("XVERSE_API", "https://api.secretkeylabs.io").rstrip("/")
+XVERSE_API_KEY = os.getenv("XVERSE_API_KEY") or None
 GUILD_ID = int(os.getenv("GUILD_ID", "0")) or None
 VERIFIED_ROLE_ID = int(os.getenv("VERIFIED_ROLE_ID", "0")) or None
 DB_PATH = os.getenv("DB_PATH", "verifications.db")
@@ -114,30 +114,27 @@ def list_verifications(discord_id: str) -> list[tuple[str, int]]:
 # ----- ordinals lookup ---------------------------------------------------
 
 async def fetch_inscriptions(address: str, max_pages: int = 10) -> list[dict]:
-    """Hiro Ordinals API. Public; HIRO_API_KEY raises rate limits."""
-    url = f"{HIRO_API}/ordinals/v1/inscriptions"
-    headers = {"Accept": "application/json"}
-    if HIRO_API_KEY:
-        headers["x-api-key"] = HIRO_API_KEY
-    out: list[dict] = []
-    offset = 0
-    limit = 60
+    """Xverse Ordinals API. Hiro's equivalent was deprecated 2026-03-09.
+
+    Returns a flat list of inscription dicts shaped roughly like the old Hiro
+    response: each item has at least `id` and `number`. If XVERSE_API_KEY is
+    unset, this returns [] rather than 401-ing — the bot keeps verifying
+    ownership, it just can't display inscription counts.
+
+    `max_pages` is currently inert: Xverse's docs note offset/limit are
+    accepted but ignored, and the API returns the full list. Kept in the
+    signature so callers don't break if pagination is reinstated.
+    """
+    if not XVERSE_API_KEY:
+        log.warning("XVERSE_API_KEY not set — skipping inscription lookup")
+        return []
+    url = f"{XVERSE_API}/v1/ordinals/address/{address}/inscriptions"
+    headers = {"Accept": "application/json", "x-api-key": XVERSE_API_KEY}
     async with httpx.AsyncClient(timeout=15) as client:
-        for _ in range(max_pages):
-            r = await client.get(
-                url,
-                params={"address": address, "limit": limit, "offset": offset},
-                headers=headers,
-            )
-            r.raise_for_status()
-            data = r.json()
-            results = data.get("results", []) or []
-            out.extend(results)
-            total = data.get("total", len(out))
-            offset += len(results)
-            if not results or offset >= total:
-                break
-    return out
+        r = await client.get(url, headers=headers)
+        r.raise_for_status()
+        data = r.json()
+    return data.get("items", []) or []
 
 
 # ----- bot lifecycle -----------------------------------------------------
