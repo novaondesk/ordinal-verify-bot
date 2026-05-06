@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>Tapseal — Sign Challenge</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0e0f12;
+      --card: #1a1c22;
+      --code-bg: #0a0b0e;
+      --text: #eee;
+      --muted: #8a8d96;
+      --accent: #f7931a;
+      --accent-text: #1a0f00;
+      --secondary: #2a2f3a;
+      --ok: #4ade80;
+      --err: #ff6464;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 1.25rem;
+      line-height: 1.4;
+    }
+    .wrap { max-width: 640px; margin: 1.5rem auto; }
+    header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem; }
+    header h1 { margin: 0; font-size: 1.25rem; font-weight: 700; }
+    header .badge { font-size: 0.7rem; color: var(--accent); border: 1px solid var(--accent); padding: 0.1rem 0.4rem; border-radius: 999px; }
+    .card { background: var(--card); border-radius: 12px; padding: 1rem 1.1rem; margin-bottom: 0.85rem; }
+    .label { color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 0.4rem; }
+    pre, code {
+      background: var(--code-bg);
+      color: #e0e0e0;
+      padding: 0.6rem 0.75rem;
+      border-radius: 8px;
+      overflow-wrap: anywhere;
+      word-break: break-all;
+      white-space: pre-wrap;
+      font-size: 0.85rem;
+      font-family: "SF Mono", "Cascadia Code", Consolas, ui-monospace, monospace;
+      margin: 0;
+    }
+    button {
+      width: 100%;
+      padding: 0.95rem 1.1rem;
+      border: 0;
+      border-radius: 10px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+      -webkit-tap-highlight-color: transparent;
+    }
+    button.primary { background: var(--accent); color: var(--accent-text); }
+    button.secondary { background: var(--secondary); color: var(--text); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    button + button { margin-top: 0.6rem; }
+    .small { font-size: 0.82rem; color: var(--muted); margin: 0.55rem 0 0; }
+    .ok { color: var(--ok); }
+    .err { color: var(--err); }
+    .hidden { display: none; }
+    a { color: var(--accent); }
+    footer { text-align: center; color: var(--muted); font-size: 0.75rem; margin-top: 2rem; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Tapseal</h1>
+      <span class="badge">BIP-322</span>
+    </header>
+
+    <div id="warn" class="card hidden"></div>
+
+    <div class="card">
+      <div class="label">Address</div>
+      <code id="addr">…</code>
+    </div>
+
+    <div class="card">
+      <div class="label">Message to sign</div>
+      <pre id="msg">…</pre>
+    </div>
+
+    <div class="card" id="sign-card">
+      <button id="sign" class="primary">🔐 Sign with my wallet</button>
+      <p class="small" id="status">
+        Tap to invoke your Bitcoin wallet (Xverse, Leather, OKX, Magic Eden,
+        UniSat). Mobile wallets will open via deep-link.
+      </p>
+    </div>
+
+    <div class="card hidden" id="result-card">
+      <div class="label">Signature</div>
+      <pre id="sig"></pre>
+      <button id="copy" class="secondary">📋 Copy signature</button>
+      <p class="small">
+        Switch back to Discord and run
+        <code>/submit signature:&lt;paste&gt;</code>.
+      </p>
+    </div>
+
+    <footer>
+      Open-source · <a href="https://github.com/0xAjax-ai/ordinal-verify-bot">github</a>
+    </footer>
+  </div>
+
+  <script type="module">
+    // Sats Connect bundles the wallet picker + deep-link logic for Xverse,
+    // Leather, OKX, Magic Eden, etc. Loaded as ESM via esm.sh — no build step.
+    import { request } from "https://esm.sh/sats-connect@3";
+
+    const $ = (id) => document.getElementById(id);
+    const params = new URLSearchParams(location.search);
+    const address = params.get("addr") || "";
+    const message = params.get("msg") || "";
+
+    if (!address || !message) {
+      const w = $("warn");
+      w.classList.remove("hidden");
+      w.innerHTML =
+        '<span class="err">Missing <code>addr</code> or <code>msg</code> in URL.</span>' +
+        '<p class="small">This page is meant to be opened from the Tapseal Discord bot.</p>';
+      $("sign").disabled = true;
+    }
+
+    $("addr").textContent = address || "(none)";
+    $("msg").textContent = message || "(none)";
+
+    $("sign").addEventListener("click", async () => {
+      const status = $("status");
+      $("sign").disabled = true;
+      status.innerHTML = "Asking your wallet…";
+      try {
+        const resp = await request("signMessage", {
+          address,
+          message,
+          protocol: "BIP322",
+        });
+        if (resp && resp.status === "success" && resp.result?.signature) {
+          $("sig").textContent = resp.result.signature;
+          $("result-card").classList.remove("hidden");
+          status.innerHTML = '<span class="ok">✅ Signed. Copy below and paste into /submit.</span>';
+          $("result-card").scrollIntoView({ behavior: "smooth", block: "start" });
+        } else {
+          const errMsg = resp?.error?.message || "Wallet returned no signature.";
+          status.innerHTML = '<span class="err">❌ ' + errMsg + "</span>";
+          $("sign").disabled = false;
+        }
+      } catch (e) {
+        const txt = (e && e.message) || String(e);
+        status.innerHTML =
+          '<span class="err">❌ ' + txt + "</span>" +
+          '<p class="small">No compatible wallet found? Try Xverse, Leather, ' +
+          "OKX, Magic Eden, or UniSat. On desktop use the browser extension; " +
+          "on mobile open this page from your wallet's in-app browser.</p>";
+        $("sign").disabled = false;
+      }
+    });
+
+    $("copy").addEventListener("click", async () => {
+      const btn = $("copy");
+      try {
+        await navigator.clipboard.writeText($("sig").textContent);
+        btn.textContent = "✓ Copied";
+        setTimeout(() => (btn.textContent = "📋 Copy signature"), 2000);
+      } catch {
+        btn.textContent = "Couldn't copy — long-press the signature above";
+      }
+    });
+  </script>
+</body>
+</html>
